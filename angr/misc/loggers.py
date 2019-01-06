@@ -37,17 +37,23 @@ class Loggers(object):
     def __dir__(self):
         return super(Loggers, self).__dir__() + self._loggers.keys()
 
-    def enable_root_logger(self):
+    def enable_related_logger(self):
         """
         Enable angr's default logger
         """
-        logging.root.addHandler(self.handler)
+        for logger in self._loggers.values():
+            if type(logger) is logging.PlaceHolder:
+                continue
+            logger.addHandler(self.handler)
 
-    def disable_root_logger(self):
+    def disable_related_logger(self):
         """
         Disable angr's default logger
         """
-        logging.root.removeHandler(self.handler)
+        for logger in self._loggers.values():
+            if type(logger) is logging.PlaceHolder:
+                continue
+            logger.removeHandler(self.handler)
 
     @staticmethod
     def setall(level):
