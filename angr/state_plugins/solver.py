@@ -483,6 +483,16 @@ class SimSolver(SimStatePlugin):
         """
         return self._solver.eval(e, n, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
 
+    def _iterate(self, e):
+        """
+        Evaluate an expression, using the solver if necessary. Returns iterator of the values.
+
+        :param e: the expression
+        :return: an iterator of the solutions
+        :rtype: iterator
+        """
+        return self._solver.iterate(e)
+
     @concrete_path_scalar
     @timed_function
     @ast_stripping_decorator
@@ -690,9 +700,13 @@ class SimSolver(SimStatePlugin):
             return [self._cast_to(e, concrete_val, cast_to)]
 
         cast_vals = [self._cast_to(e, v, cast_to) for v in self._eval(e, n, **kwargs)]
-        if len(cast_vals) == 0:
-            raise SimUnsatError('Not satisfiable: %s, expected up to %d solutions' % (e.shallow_repr(), n))
+        # if len(cast_vals) == 0:
+        #     raise SimUnsatError('Not satisfiable: %s, expected up to %d solutions' % (e.shallow_repr(), n))
         return cast_vals
+
+    def iterate(self, e):
+        iterator = self._iterate(e)
+        return iterator[0]
 
     def eval(self, e, **kwargs):
         """
