@@ -10,6 +10,7 @@ from ...storage.file import SimPackets
 l = logging.getLogger(name=__name__)
 ascii_digits = ascii_digits.encode()
 
+
 class FormatString(object):
     """
     Describes a format string.
@@ -78,7 +79,9 @@ class FormatString(object):
                 # integers, for most of these we'll end up concretizing values..
                 else:
                     i_val = args(argpos)
-                    c_val = int(self.parser.state.solver.eval(i_val))
+                    tmp_val = self.parser.state.solver.eval(i_val)
+                    print("********************", tmp_val, "*********************")
+                    c_val = int(tmp_val[0]) if type(tmp_val) is tuple else tmp_val
                     c_val &= (1 << (fmt_spec.size * 8)) - 1
                     if fmt_spec.signed and (c_val & (1 << ((fmt_spec.size * 8) - 1))):
                         c_val -= (1 << fmt_spec.size * 8)
