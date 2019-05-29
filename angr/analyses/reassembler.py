@@ -307,6 +307,20 @@ class SymbolManager(object):
         self.cfg = cfg
 
         self.addr_to_label = defaultdict(list)
+        self.symbol_names = set()  # deduplicate symbol names
+
+    def get_unique_symbol_name(self, symbol_name):
+        if symbol_name not in self.symbol_names:
+            self.symbol_names.add(symbol_name)
+            return symbol_name
+
+        i = 0
+        while True:
+            name = "%s_%d" % (symbol_name, i)
+            if name not in self.symbol_names:
+                self.symbol_names.add(name)
+                return name
+            i += 1
 
     def new_label(self, addr, name=None, is_function=None, force=False):
 
@@ -338,13 +352,16 @@ class SymbolManager(object):
                 # check the type...
                 if symbol.type == cle.Symbol.TYPE_FUNCTION:
                     # it's a function!
-                    label = FunctionLabel(self.binary, symbol_name, addr)
+                    unique_symbol_name = self.get_unique_symbol_name(symbol_name)
+                    label = FunctionLabel(self.binary, unique_symbol_name, addr)
                 elif symbol.type == cle.Symbol.TYPE_OBJECT:
                     # it's an object
-                    label = ObjectLabel(self.binary, symbol_name, addr)
+                    unique_symbol_name = self.get_unique_symbol_name(symbol_name)
+                    label = ObjectLabel(self.binary, unique_symbol_name, addr)
                 elif symbol.type == cle.Symbol.TYPE_NONE:
                     # notype
-                    label = NotypeLabel(self.binary, symbol_name, addr)
+                    unique_symbol_name = self.get_unique_symbol_name(symbol_name)
+                    label = NotypeLabel(self.binary, unique_symbol_name, addr)
                 elif symbol.type == cle.Symbol.TYPE_SECTION:
                     # section label
                     # use a normal label instead
@@ -1196,7 +1213,7 @@ class Data(object):
                 # it's not aligned?
                 raise BinaryError('Fails at Data.shrink()')
 
-            pointers = self.size / pointer_size
+            pointers = self.size // pointer_size
             self._content = self._content[ : pointers]
 
         else:
@@ -1656,8 +1673,6 @@ class Reassembler(Analysis):
         self._main_nonexecutable_regions = None
 
         self._symbolization_needed = True
-
-        self._ffi = cffi.FFI()
 
         # section names to alignments
         self._section_alignments = {}
@@ -2146,20 +2161,22 @@ class Reassembler(Analysis):
         # there is a single function referencing them
         cgcpl_memory_data = self.cfg.memory_data.get(cgc_package_list.addr, None)
         cgcea_memory_data = self.cfg.memory_data.get(cgc_extended_application.addr, None)
+        refs = self.cfg.model.references
 
         if cgcpl_memory_data is None or cgcea_memory_data is None:
             return False
 
-        if len(cgcpl_memory_data.refs) != 1:
+        if len(refs.data_addr_to_ref[cgcpl_memory_data.addr]) != 1:
             return False
-        if len(cgcea_memory_data.refs) != 1:
+        if len(refs.data_addr_to_ref[cgcea_memory_data.addr]) != 1:
             return False
 
         # check if the irsb addresses are the same
-        if next(iter(cgcpl_memory_data.refs))[0] != next(iter(cgcea_memory_data.refs))[0]:
+        if next(iter(refs.data_addr_to_ref[cgcpl_memory_data.addr])).block_addr != \
+                next(iter(refs.data_addr_to_ref[cgcea_memory_data.addr])).block_addr:
             return False
 
-        insn_addr = next(iter(cgcpl_memory_data.refs))[2]
+        insn_addr = next(iter(refs.data_addr_to_ref[cgcpl_memory_data.addr])).insn_addr
         # get the basic block
         cfg_node = self.cfg.get_any_node(insn_addr, anyaddr=True)
         if not cfg_node:
@@ -2267,7 +2284,6 @@ class Reassembler(Analysis):
             '__progname_full',
             '_IO_stdin_used',
             'obstack_alloc_failed_hand',
-            'program_invocation_short_',
             'optind',
             'optarg',
             '__progname',
@@ -2743,7 +2759,7 @@ class Reassembler(Analysis):
             if candidate_node is None:
                 continue
             base_graph.add_node(candidate_node)
-            tmp_kb = KnowledgeBase(self.project, self.project.loader.main_object)
+            tmp_kb = KnowledgeBase(self.project)
             cfg = self.project.analyses.CFGEmulated(kb=tmp_kb,
                                                     starts=(candidate.irsb_addr,),
                                                     keep_state=True,

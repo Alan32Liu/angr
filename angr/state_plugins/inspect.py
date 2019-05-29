@@ -64,6 +64,7 @@ inspect_attributes = {
 
     # expr
     'expr',
+    'expr_result',
 
     # statement
     'statement',
@@ -210,7 +211,7 @@ from .plugin import SimStatePlugin
 class SimInspector(SimStatePlugin):
     """
     The breakpoint interface, used to instrument execution. For usage information, look here:
-    https://docs.angr.io/docs/simuvex.html#breakpoints
+    https://docs.angr.io/core-concepts/simulation#breakpoints
     """
     BP_AFTER = BP_AFTER
     BP_BEFORE = BP_BEFORE
@@ -336,6 +337,10 @@ class SimInspector(SimStatePlugin):
 
     def widen(self, others):
         return self._combine(others)
+
+    def set_state(self, state):
+        super().set_state(state)
+        state.supports_inspect = True
 
 
 from angr.sim_state import SimState

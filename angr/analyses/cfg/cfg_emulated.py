@@ -9,11 +9,7 @@ import networkx
 import pyvex
 from archinfo import ArchARM
 
-from .cfg_base import CFGBase
-from .cfg_job_base import BlockID, CFGJobBase
-from .cfg_node import CFGENode
-from .cfg_utils import CFGUtils
-from ..forward_analysis import ForwardAnalysis
+
 from ... import BP, BP_BEFORE, BP_AFTER, SIM_PROCEDURES, procedures
 from ... import options as o
 from ...engines import SimEngineProcedure
@@ -26,6 +22,12 @@ from ...errors import AngrCFGError, AngrError, AngrSkipJobNotice, SimError, SimV
 from ...sim_state import SimState
 from ...state_plugins.callstack import CallStack
 from ...state_plugins.sim_action import SimActionData
+from ...knowledge_plugins.cfg import CFGENode
+from ...utils.constants import DEFAULT_STATEMENT
+from ..forward_analysis import ForwardAnalysis
+from .cfg_base import CFGBase
+from .cfg_job_base import BlockID, CFGJobBase
+from .cfg_utils import CFGUtils
 
 l = logging.getLogger(name=__name__)
 
@@ -149,6 +151,7 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
                  max_steps=None,
                  state_add_options=None,
                  state_remove_options=None,
+                 model=None,
                  ):
         """
         All parameters are optional.
@@ -203,6 +206,7 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
                          resolve_indirect_jumps=resolve_indirect_jumps,
                          indirect_jump_resolvers=indirect_jump_resolvers,
                          indirect_jump_target_limit=indirect_jump_target_limit,
+                         model=model,
         )
 
         if start is not None:
@@ -232,6 +236,7 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
         self._max_steps = max_steps
         self._state_add_options = state_add_options if state_add_options is not None else set()
         self._state_remove_options = state_remove_options if state_remove_options is not None else set()
+        self._state_add_options.update([o.SYMBOL_FILL_UNCONSTRAINED_MEMORY, o.SYMBOL_FILL_UNCONSTRAINED_REGISTERS])
 
         # add the track_memory_option if the enable function hint flag is set
         if self._enable_function_hints and o.TRACK_MEMORY_ACTIONS not in self._state_add_options:
@@ -271,8 +276,6 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
         # A dict to log edges and the jumpkind between each basic block
         self._edge_map = defaultdict(list)
 
-        self._nodes = {}
-        self._nodes_by_addr = defaultdict(list)
         self._start_keys = [ ]  # a list of block IDs of all starts
 
         # For each call, we are always getting two exits: an Ijk_Call that
@@ -321,9 +324,6 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
         new_cfg.project = self.project
 
         # Intelligently (or stupidly... you tell me) fill it up
-        new_cfg._graph = networkx.DiGraph(self._graph)
-        new_cfg._nodes = self._nodes.copy()
-        new_cfg._nodes_by_addr = self._nodes_by_addr.copy() if self._nodes_by_addr is not None else None
         new_cfg._edge_map = self._edge_map.copy()
         new_cfg._loop_back_edges = self._loop_back_edges[::]
         new_cfg._executable_address_ranges = self._executable_address_ranges[::]
@@ -559,7 +559,7 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
         # Update loop backedges
         self._loop_back_edges = loop_backedges
 
-        self._graph = graph_copy
+        self.model.graph = graph_copy
 
     def immediate_dominators(self, start, target_graph=None):
         """
@@ -712,27 +712,24 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
     def __setstate__(self, s):
         self.project = s['project']
         self.indirect_jumps = s['indirect_jumps']
-        self._graph = s['graph']
         self._loop_back_edges = s['_loop_back_edges']
-        self._nodes = s['_nodes']
-        self._nodes_by_addr = s['_nodes_by_addr']
         self._thumb_addrs = s['_thumb_addrs']
         self._unresolvable_runs = s['_unresolvable_runs']
         self._executable_address_ranges = s['_executable_address_ranges']
         self._iropt_level = s['_iropt_level']
+        self._model = s['_model']
 
     def __getstate__(self):
         s = {
             'project': self.project,
             "indirect_jumps": self.indirect_jumps,
-            'graph': self._graph,
             '_loop_back_edges': self._loop_back_edges,
-            '_nodes': self._nodes,
             '_nodes_by_addr': self._nodes_by_addr,
             '_thumb_addrs': self._thumb_addrs,
             '_unresolvable_runs': self._unresolvable_runs,
             '_executable_address_ranges': self._executable_address_ranges,
             '_iropt_level': self._iropt_level,
+            '_model': self._model
         }
 
         return s
@@ -740,6 +737,10 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
     #
     # Properties
     #
+
+    @property
+    def graph(self):
+        return self._model.graph
 
     @property
     def unresolvables(self):
@@ -1275,7 +1276,8 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
             # Try to resolve indirect jumps
             irsb = input_state.block().vex
 
-            resolved, resolved_targets, ij = self._indirect_jump_encountered(addr, cfg_node, irsb, func_addr, stmt_idx='default')
+            resolved, resolved_targets, ij = self._indirect_jump_encountered(addr, cfg_node, irsb, func_addr,
+                                                                             stmt_idx=DEFAULT_STATEMENT)
             if resolved:
                 successors = self._convert_indirect_jump_targets_to_states(job, resolved_targets)
                 if ij:
@@ -1383,13 +1385,13 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
                     # the return target node may not exist yet. If that's the case, we will put it into a "delayed edge
                     # list", and add this edge later when the return target CFGNode is created.
                     if return_target_key in self._nodes:
-                        self._graph_add_edge(job.block_id, return_target_key, jumpkind='Ijk_Ret', stmt_id='default',
-                                             ins_addr=ret_ins_addr)
+                        self._graph_add_edge(job.block_id, return_target_key, jumpkind='Ijk_Ret',
+                                             stmt_id=DEFAULT_STATEMENT, ins_addr=ret_ins_addr)
                     else:
                         self._pending_edges[return_target_key].append((job.block_id, return_target_key,
                                                                        {
                                                                            'jumpkind': 'Ijk_Ret',
-                                                                           'stmt_id': 'default',
+                                                                           'stmt_id': DEFAULT_STATEMENT,
                                                                            'ins_addr': ret_ins_addr,
                                                                         }
                                                                        )
@@ -1493,8 +1495,8 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
         function_name = func.name if func is not None else None
         module_name = obj.provides if obj is not None else None
 
-        depth_str = "(D:%s)" % self.get_node(job.block_id).depth if self.get_node(job.block_id).depth is not None \
-            else ""
+        node = self.model.get_node(job.block_id)
+        depth_str = "(D:%s)" % node.depth if node.depth is not None else ""
 
         l.debug("%s [%#x%s | %s]", sim_successors.description, sim_successors.addr, depth_str,
                 "->".join([hex(i) for i in call_stack_suffix if i is not None])
@@ -1850,7 +1852,7 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
         self._update_function_transition_graph(job.block_id, None,
                                                jumpkind=successor_jumpkind,
                                                ins_addr=successor_last_ins_addr,
-                                               stmt_idx='default',
+                                               stmt_idx=DEFAULT_STATEMENT,
                                                )
 
     # SimAction handling
@@ -1917,18 +1919,15 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
                 # TODO: Is it really OK?
                 func_addr = self._block_id_addr(node_key)
 
-            is_syscall = node_key.jump_type == 'syscall'
             is_thumb = isinstance(self.project.arch, ArchARM) and addr % 2 == 1
 
             pt = CFGENode(self._block_id_addr(node_key),
                           None,
-                          self,
-                          callstack=None,  # getting a callstack here is difficult, so we pass in a callstack key instead
+                          self.model,
                           input_state=None,
                           simprocedure_name="PathTerminator",
                           function_address=func_addr,
                           callstack_key=self._block_id_callstack_key(node_key),
-                          is_syscall=is_syscall,
                           thumb=is_thumb
                           )
             if self._keep_state:
@@ -2937,7 +2936,7 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
             # Ijk_Ret. The last exit is simulated.
             # Notice: We assume the last exit is the simulated one
             if len(all_jobs) > 1 and all_jobs[-1].history.jumpkind == "Ijk_FakeRet":
-                se = all_jobs[-1].se
+                se = all_jobs[-1].solver
                 retn_target_addr = se.eval_one(all_jobs[-1].ip, default=0)
                 sp = se.eval_one(all_jobs[-1].regs.sp, default=0)
 
@@ -2948,7 +2947,7 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
             elif jumpkind.startswith('Ijk_Sys') and len(all_jobs) == 1:
                 # This is a syscall. It returns to the same address as itself (with a different jumpkind)
                 retn_target_addr = exit_target
-                se = all_jobs[0].se
+                se = all_jobs[0].solver
                 sp = se.eval_one(all_jobs[0].regs.sp, default=0)
                 new_call_stack = new_call_stack.call(addr, exit_target,
                                     retn_target=retn_target_addr,
@@ -2958,7 +2957,7 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
                 # We don't have a fake return exit available, which means
                 # this call doesn't return.
                 new_call_stack = CallStack()
-                se = all_jobs[-1].se
+                se = all_jobs[-1].solver
                 sp = se.eval_one(all_jobs[-1].regs.sp, default=0)
 
                 new_call_stack = new_call_stack.call(addr, exit_target, retn_target=None, stack_pointer=sp)
@@ -2971,7 +2970,7 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
             except SimEmptyCallStackError:
                 pass
 
-            se = all_jobs[-1].se
+            se = all_jobs[-1].solver
             sp = se.eval_one(all_jobs[-1].regs.sp, default=0)
             old_sp = job.current_stack_pointer
 
@@ -3054,14 +3053,13 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
 
             cfg_node = CFGENode(sim_successors.addr,
                                 None,
-                                self,
-                                callstack=call_stack,
+                                self.model,
+                                callstack_key=call_stack.stack_suffix(self.context_sensitivity_level),
                                 input_state=None,
                                 simprocedure_name=simproc_name,
                                 syscall_name=syscall,
                                 no_ret=no_ret,
                                 is_syscall=is_syscall,
-                                syscall=syscall,
                                 function_address=sim_successors.addr,
                                 block_id=block_id,
                                 depth=depth,
@@ -3072,11 +3070,10 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
         else:
             cfg_node = CFGENode(sim_successors.addr,
                                 sa['irsb_size'],
-                                self,
-                                callstack=call_stack,
+                                self.model,
+                                callstack_key=call_stack.stack_suffix(self.context_sensitivity_level),
                                 input_state=None,
                                 is_syscall=is_syscall,
-                                syscall=syscall,
                                 function_address=func_addr,
                                 block_id=block_id,
                                 depth=depth,
@@ -3105,7 +3102,7 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
             for loop in loop_finder.loops:  # type: angr.analyses.loopfinder.Loop
                 loop_callback(graph_copy, loop)
 
-            self._graph = graph_copy
+            self.model.graph = graph_copy
 
         # Update loop backedges and graph
         self._loop_back_edges = list(itertools.chain.from_iterable(loop.continue_edges for loop in loop_finder.loops))
@@ -3164,7 +3161,7 @@ class CFGEmulated(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-metho
                     continue
 
                 suc = all_successors[0]
-                se = suc.se
+                se = suc.solver
                 # Examine the path log
                 actions = suc.history.recent_actions
                 sp = se.eval_one(suc.regs.sp, default=0) + self.project.arch.call_sp_fix
