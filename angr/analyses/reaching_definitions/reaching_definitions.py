@@ -9,6 +9,7 @@ from ...calling_conventions import SimRegArg, SimStackArg
 from ...engines.light import SpOffset
 from ...keyed_region import KeyedRegion
 from ...block import Block
+from ...knowledge_plugins.functions.function_manager import Function
 from ...codenode import CodeNode
 from ...misc.ux import deprecated
 from .. import register_analysis
@@ -69,6 +70,7 @@ class LiveDefinitions:
         self.register_uses = Uses()
         self.stack_uses = Uses()
         self.memory_uses = Uses()
+        self.uses_by_codeloc = defaultdict(set)
         self.tmp_uses = defaultdict(set)
 
         self._dead_virgin_definitions = set()  # definitions that are killed before used
@@ -203,7 +205,7 @@ class LiveDefinitions:
         elif type(atom) is MemoryLocation:
             self._kill_and_add_memory_definition(atom, code_loc, data, dummy=dummy)
         elif type(atom) is Tmp:
-            self._add_tmp_definition(atom, code_loc)
+            self._add_tmp_definition(atom, code_loc, data)
         else:
             raise NotImplementedError()
 
@@ -216,6 +218,18 @@ class LiveDefinitions:
             self._add_memory_use(atom, code_loc)
         elif type(atom) is Tmp:
             self._add_tmp_use(atom, code_loc)
+
+    def add_use_by_def(self, def_, code_loc):
+        if type(def_.atom) is Register:
+            self._add_register_use_by_def(def_, code_loc)
+        elif type(def_.atom) is SpOffset:
+            self._add_stack_use_by_def(def_, code_loc)
+        elif type(def_.atom) is MemoryLocation:
+            self._add_memory_use_by_def(def_, code_loc)
+        elif type(def_.atom) is Tmp:
+            self._add_tmp_use_by_def(def_, code_loc)
+        else:
+            raise TypeError()
 
     #
     # Private methods
@@ -253,9 +267,12 @@ class LiveDefinitions:
         # set_object() replaces kill (not implemented) and add (add) in one step
         self.memory_definitions.set_object(atom.addr, definition, atom.size)
 
-    def _add_tmp_definition(self, atom, code_loc):
+    def _add_tmp_definition(self, atom, code_loc, data):
 
-        self.tmp_definitions[atom.tmp_idx] = (atom, code_loc)
+        if self._track_tmps:
+            self.tmp_definitions[atom.tmp_idx] = Definition(atom, code_loc, data)
+        else:
+            self.tmp_definitions[atom.tmp_idx] = self.uses_by_codeloc[code_loc]
 
     def _add_register_use(self, atom, code_loc):
 
@@ -263,7 +280,11 @@ class LiveDefinitions:
         current_defs = self.register_definitions.get_objects_by_offset(atom.reg_offset)
 
         for current_def in current_defs:
-            self.register_uses.add_use(current_def, code_loc)
+            self._add_register_use_by_def(current_def, code_loc)
+
+    def _add_register_use_by_def(self, def_, code_loc):
+        self.register_uses.add_use(def_, code_loc)
+        self.uses_by_codeloc[code_loc].add(def_)
 
     def _add_stack_use(self, atom, code_loc):
         """
@@ -276,7 +297,11 @@ class LiveDefinitions:
         current_defs = self.stack_definitions.get_objects_by_offset(atom.offset)
 
         for current_def in current_defs:
-            self.stack_uses.add_use(current_def, code_loc)
+            self._add_stack_use_by_def(current_def, code_loc)
+
+    def _add_stack_use_by_def(self, def_, code_loc):
+        self.stack_uses.add_use(def_, code_loc)
+        self.uses_by_codeloc[code_loc].add(def_)
 
     def _add_memory_use(self, atom, code_loc):
 
@@ -284,12 +309,26 @@ class LiveDefinitions:
         current_defs = self.memory_definitions.get_objects_by_offset(atom.addr)
 
         for current_def in current_defs:
-            self.memory_uses.add_use(current_def, code_loc)
+            self._add_memory_use_by_def(current_def, code_loc)
+
+    def _add_memory_use_by_def(self, def_, code_loc):
+        self.memory_uses.add_use(def_, code_loc)
+        self.uses_by_codeloc[code_loc].add(def_)
 
     def _add_tmp_use(self, atom, code_loc):
 
-        current_def = self.tmp_definitions[atom.tmp_idx]
-        self.tmp_uses[atom.tmp_idx].add((code_loc, current_def))
+        if self._track_tmps:
+            def_ = self.tmp_definitions[atom.tmp_idx]
+            self._add_tmp_use_by_def(def_, code_loc)
+        else:
+            defs = self.tmp_definitions[atom.tmp_idx]
+            for d in defs:
+                assert not type(d.atom) is Tmp
+                self.add_use_by_def(d, code_loc)
+
+    def _add_tmp_use_by_def(self, def_, code_loc):
+        self.tmp_uses[def_.atom.tmp_idx].add(code_loc)
+        self.uses_by_codeloc[code_loc].add(def_)
 
 
 class ReachingDefinitionAnalysis(ForwardAnalysis, Analysis):  # pylint:disable=abstract-method
@@ -306,14 +345,11 @@ class ReachingDefinitionAnalysis(ForwardAnalysis, Analysis):  # pylint:disable=a
     * Some more documentation and examples would be nice.
     """
 
-    def __init__(self, func=None, block=None, func_graph=None, max_iterations=3, track_tmps=False,
+    def __init__(self, subject=None, func_graph=None, max_iterations=3, track_tmps=False,
                  observation_points=None, init_state=None, init_func=False, cc=None, function_handler=None,
                  current_local_call_depth=1, maximum_local_call_depth=5, observe_all=False):
         """
-
-        :param angr.knowledge.Function func:    The function to run reaching definition analysis on.
-        :param block:                           A single block to run reaching definition analysis on. You cannot
-                                                specify both `func` and `block`.
+        :param Block|Function subject: The subject of the analysis: a function, or a single basic block.
         :param func_graph:                      Alternative graph for function.graph.
         :param int max_iterations:              The maximum number of iterations before the analysis is terminated.
         :param Boolean track_tmps:              Whether or not temporary variables should be taken into consideration
@@ -333,24 +369,26 @@ class ReachingDefinitionAnalysis(ForwardAnalysis, Analysis):  # pylint:disable=a
         :param Boolean observe_all:             Observe every statement, both before and after.
         """
 
-        if func is not None:
-            if block is not None:
-                raise ValueError('You cannot specify both "func" and "block".')
-            # traversing a function
-            graph_visitor = FunctionGraphVisitor(func, func_graph)
-        elif block is not None:
-            # traversing a block
-            graph_visitor = SingleNodeGraphVisitor(block)
-        else:
-            raise ValueError('Unsupported analysis target.')
+        def _init_subject(subject):
+            """
+            :param ailment.Block|angr.Block|Function subject:
+            :return Tuple[ailment.Block|angr.Block, SimCC, Function, GraphVisitor, Boolean]:
+                 Return the values for `_block`, `_cc`, `_function`, `_graph_visitor`, `_init_func`.
+            """
+            if isinstance(subject, Function):
+                return (None, cc, subject, FunctionGraphVisitor(subject, func_graph), init_func)
+            elif isinstance(subject, (ailment.Block, Block)):
+                return (subject, None, None, SingleNodeGraphVisitor(subject), False)
+            else:
+                raise ValueError('Unsupported analysis target.')
+
+        self._block, self._cc, self._function, self._graph_visitor, self._init_func = _init_subject(subject)
 
         ForwardAnalysis.__init__(self, order_jobs=True, allow_merging=True, allow_widening=False,
-                                 graph_visitor=graph_visitor)
+                                 graph_visitor=self._graph_visitor)
 
         self._track_tmps = track_tmps
         self._max_iterations = max_iterations
-        self._function = func
-        self._block = block
         self._observation_points = observation_points
         self._init_state = init_state
         self._function_handler = function_handler
@@ -360,16 +398,6 @@ class ReachingDefinitionAnalysis(ForwardAnalysis, Analysis):  # pylint:disable=a
         if self._init_state is not None:
             self._init_state = self._init_state.copy()
             self._init_state.analysis = self
-
-        # ignore initialization parameters if a block was passed
-        if self._function is not None:
-            self._init_func = init_func
-            self._cc = cc
-            self._func_addr = func.addr
-        else:
-            self._init_func = False
-            self._cc = None
-            self._func_addr = None
 
         self._observe_all = observe_all
 
@@ -477,8 +505,9 @@ class ReachingDefinitionAnalysis(ForwardAnalysis, Analysis):  # pylint:disable=a
         if self._init_state is not None:
             return self._init_state
         else:
+            func_addr = self._function.addr if self._function else None
             return LiveDefinitions(self.project.arch, track_tmps=self._track_tmps, analysis=self,
-                                   init_func=self._init_func, cc=self._cc, func_addr=self._func_addr)
+                                   init_func=self._init_func, cc=self._cc, func_addr=func_addr)
 
     def _merge_states(self, node, *states):
         return states[0].merge(*states[1:])
